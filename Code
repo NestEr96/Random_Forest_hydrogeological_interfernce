@@ -1,0 +1,633 @@
+"""
+CODE 1
+------
+Random Forest vs DHI indices on TAV_Machine dataset.
+Includes bootstrap comparison and ROC analysis.
+"""
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    matthews_corrcoef,
+    roc_curve,
+    roc_auc_score
+)
+from sklearn.inspection import permutation_importance
+
+# -------------------------------
+# Settings
+# -------------------------------
+TEST_SIZE = 0.30
+RANDOM_STATES = range(1, 101)
+N_BOOTSTRAP = 10_000
+ALPHA = 0.05
+mean_fpr = np.linspace(0, 1, 100)
+
+# -------------------------------
+# Data loading
+# -------------------------------
+df = pd.read_csv("TAV_Machine.csv", sep=";")
+
+target = "Impatto"
+y_true = df[target].values
+
+X = df.drop(columns=[
+    target, "Numero", "DHI1", "DHI2",
+    "Spring group", "A/P", "Qm (L/s)", "Tipo", 
+    "Fault distance (m)", "Fault distance 2 (m)"
+])
+
+# -------------------------------
+# Containers
+# -------------------------------
+y_pred_rf_list = []
+test_indices_list = []
+
+tpr_list = []
+auc_list = []
+
+acc_list = []
+prec_list = []
+rec_list = []
+f1_list = []
+mcc_list = []
+
+pfi_list = []        # list of arrays (one per split)
+feature_names = X.columns
+# -------------------------------
+# Random Forest training loop
+# -------------------------------
+for rs in RANDOM_STATES:
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y_true,
+        test_size=TEST_SIZE,
+        stratify=y_true,
+        random_state=rs
+    )
+
+    model = RandomForestClassifier(
+        random_state=rs,
+        max_depth=5,
+        n_estimators=440,
+        max_features="sqrt"
+    )
+
+    model.fit(X_train, y_train)
+
+    # Predictions
+    y_pred = model.predict(X_test)
+    y_pred_rf_list.append(y_pred)
+    test_indices_list.append(X_test.index)
+    
+    # --- Classification metrics ---
+    acc_list.append(accuracy_score(y_test, y_pred))
+    prec_list.append(precision_score(y_test, y_pred))
+    rec_list.append(recall_score(y_test, y_pred))
+    f1_list.append(f1_score(y_test, y_pred))
+    mcc_list.append(matthews_corrcoef(y_test, y_pred))
+
+    # --- ROC computation for current split ---
+    y_scores = model.predict_proba(X_test)[:, 1]
+
+    fpr, tpr, _ = roc_curve(y_test, y_scores)
+    roc_auc = roc_auc_score(y_test, y_scores)
+
+    # Interpolate TPR over a common FPR grid
+    tpr_interp = np.interp(mean_fpr, fpr, tpr)
+    tpr_interp[0] = 0.0
+
+    tpr_list.append(tpr_interp)
+    auc_list.append(roc_auc)
+
+    # ---------------------------------
+    # Permutation Feature Importance
+    # ---------------------------------
+    pfi = permutation_importance(
+        model,
+        X_test,
+        y_test,
+        n_repeats=20,                 # standard compromise accuracy / time
+        random_state=rs,
+        scoring="roc_auc"             # coerente con ROC analysis
+    )
+
+    pfi_list.append(pfi.importances_mean)
+# -------------------------------
+# Aggregate RF predictions
+# -------------------------------
+y_pred_rf_full = np.full(len(df), np.nan)
+for preds, idx in zip(y_pred_rf_list, test_indices_list):
+    y_pred_rf_full[idx] = preds
+
+y_pred_rf_full = y_pred_rf_full.astype(int)
+
+# -------------------------------
+# Final statistics (mean ± std)
+# -------------------------------
+metrics_summary = {
+    "Accuracy": (np.mean(acc_list), np.std(acc_list)),
+    "Precision": (np.mean(prec_list), np.std(prec_list)),
+    "Recall": (np.mean(rec_list), np.std(rec_list)),
+    "F1-score": (np.mean(f1_list), np.std(f1_list)),
+    "MCC": (np.mean(mcc_list), np.std(mcc_list)),
+    "AUC": (np.mean(auc_list), np.std(auc_list)),
+}
+
+print("\nPerformance metrics (mean ± std over 100 splits)")
+for m, (mean, std) in metrics_summary.items():
+    print(f"{m:10s}: {mean:.3f} ± {std:.3f}")
+
+acc_tav, acc_tav_std = metrics_summary["Accuracy"]
+prec_tav, prec_tav_std = metrics_summary["Precision"]
+rec_tav, rec_tav_std = metrics_summary["Recall"]
+f1_tav, f1_tav_std = metrics_summary["F1-score"]
+mcc_tav, mcc_tav_std = metrics_summary["MCC"]
+auc_tav, auc_tav_std = metrics_summary["AUC"]
+
+# -------------------------------
+# DHI predictions
+# -------------------------------
+y_pred_dhi1 = df["DHI1"].values.astype(int)
+y_pred_dhi2 = df["DHI2"].values.astype(int)
+
+# -------------------------------
+# Bootstrap comparison
+# -------------------------------
+def bootstrap_diff(y_true, yA, yB, metric):
+    rng = np.random.default_rng(42)
+    delta = np.empty(N_BOOTSTRAP)
+
+    for i in range(N_BOOTSTRAP):
+        idx = rng.integers(0, len(y_true), len(y_true))
+        if metric == f1_score:
+            delta[i] = (
+                metric(y_true[idx], yA[idx], average="weighted")
+                - metric(y_true[idx], yB[idx], average="weighted")
+            )
+        else:
+            delta[i] = metric(y_true[idx], yA[idx]) - metric(y_true[idx], yB[idx])
+
+    return np.mean(delta), *np.percentile(delta, [2.5, 97.5])
+
+# -------------------------------
+# ROC plot
+# -------------------------------
+mean_tpr = np.mean(tpr_list, axis=0)
+mean_auc = np.mean(auc_list)
+std_auc = np.std(auc_list)
+
+plt.figure(figsize=(7, 6))
+plt.plot(mean_fpr, mean_tpr,
+         label=f"RF (AUC = {mean_auc:.2f} ± {std_auc:.2f})",
+         linewidth=2)
+plt.plot([0, 1], [0, 1], "--", lw=1)
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("ROC – TAV_Machine dataset")
+plt.legend()
+plt.grid(alpha=0.3)
+plt.show()
+
+# -----------------------------
+# PFI statistics (mean ± std)
+# -----------------------------
+pfi_array = np.vstack(pfi_list)
+
+pfi_mean = pfi_array.mean(axis=0)
+pfi_std = pfi_array.std(axis=0)
+
+pfi_df = pd.DataFrame({
+    "Feature": feature_names,
+    "PFI_mean": pfi_mean,
+    "PFI_std": pfi_std
+}).sort_values("PFI_mean", ascending=False)
+
+print("\nTop 10 Permutation Feature Importances")
+print(pfi_df.head(10))
+
+# -----------------------------
+# PFI plot (Top features)
+# -----------------------------
+top_n = 15
+plt.figure(figsize=(8, 6))
+
+plt.barh(
+    pfi_df["Feature"].head(top_n)[::-1],
+    pfi_df["PFI_mean"].head(top_n)[::-1],
+    xerr=pfi_df["PFI_std"].head(top_n)[::-1],
+    alpha=0.7
+)
+
+plt.xlabel("Permutation Feature Importance (mean ± std)")
+plt.title("Permutation Feature Importance")
+plt.grid(axis="x", alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+"""
+CODE 2
+------
+Random Forest vs DHI indices on Sorgenti_GS_nomi dataset.
+Includes bootstrap comparison and ROC analysis.
+"""
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    matthews_corrcoef,
+    roc_curve,
+    roc_auc_score
+)
+from sklearn.inspection import permutation_importance
+
+# -------------------------------
+# Settings
+# -------------------------------
+TEST_SIZE = 0.30
+RANDOM_STATES = range(1, 101)
+N_BOOTSTRAP = 10_000
+ALPHA = 0.05
+mean_fpr = np.linspace(0, 1, 100)
+
+# -------------------------------
+# Data loading
+# -------------------------------
+df = pd.read_csv("Sorgenti_GS_nomi.csv", sep=";")
+
+target = "Impatto"
+y_true = df[target].values
+
+X = df.drop(columns=[
+    target, "Nome", "DHI1", "DHI2",
+    "Spring group", "A/P", "Qm (L/s)", "Tip"
+])
+
+# -------------------------------
+# Containers
+# -------------------------------
+y_pred_rf_list = []
+test_indices_list = []
+
+tpr_list = []
+auc_list = []
+
+acc_list = []
+prec_list = []
+rec_list = []
+f1_list = []
+mcc_list = []
+
+# -------------------------------
+# Random Forest training loop
+# -------------------------------
+for rs in RANDOM_STATES:
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y_true,
+        test_size=TEST_SIZE,
+        stratify=y_true,
+        random_state=rs
+    )
+
+    model = RandomForestClassifier(
+        random_state=rs,
+        max_depth=5,
+        n_estimators=440,
+        max_features="sqrt"
+    )
+
+    model.fit(X_train, y_train)
+
+    # Predictions
+    y_pred = model.predict(X_test)
+    y_pred_rf_list.append(y_pred)
+    test_indices_list.append(X_test.index)
+
+    # --- Classification metrics ---
+    acc_list.append(accuracy_score(y_test, y_pred))
+    prec_list.append(precision_score(y_test, y_pred))
+    rec_list.append(recall_score(y_test, y_pred))
+    f1_list.append(f1_score(y_test, y_pred))
+    mcc_list.append(matthews_corrcoef(y_test, y_pred))
+
+    # --- ROC computation for current split ---
+    y_scores = model.predict_proba(X_test)[:, 1]
+
+    fpr, tpr, _ = roc_curve(y_test, y_scores)
+    roc_auc = roc_auc_score(y_test, y_scores)
+
+    # Interpolate TPR over a common FPR grid
+    tpr_interp = np.interp(mean_fpr, fpr, tpr)
+    tpr_interp[0] = 0.0
+
+    tpr_list.append(tpr_interp)
+    auc_list.append(roc_auc)
+
+# -------------------------------
+# Aggregate RF predictions
+# -------------------------------
+y_pred_rf_full = np.full(len(df), np.nan)
+for preds, idx in zip(y_pred_rf_list, test_indices_list):
+    y_pred_rf_full[idx] = preds
+
+y_pred_rf_full = y_pred_rf_full.astype(int)
+
+# -------------------------------
+# Final statistics (mean ± std)
+# -------------------------------
+metrics_summary = {
+    "Accuracy": (np.mean(acc_list), np.std(acc_list)),
+    "Precision": (np.mean(prec_list), np.std(prec_list)),
+    "Recall": (np.mean(rec_list), np.std(rec_list)),
+    "F1-score": (np.mean(f1_list), np.std(f1_list)),
+    "MCC": (np.mean(mcc_list), np.std(mcc_list)),
+    "AUC": (np.mean(auc_list), np.std(auc_list)),
+}
+
+print("\nPerformance metrics (mean ± std over 100 splits)")
+for m, (mean, std) in metrics_summary.items():
+    print(f"{m:10s}: {mean:.3f} ± {std:.3f}")
+
+acc_gs, acc_gs_std = metrics_summary["Accuracy"]
+prec_gs, prec_gs_std = metrics_summary["Precision"]
+rec_gs, rec_gs_std = metrics_summary["Recall"]
+f1_gs, f1_gs_std = metrics_summary["F1-score"]
+mcc_gs, mcc_gs_std = metrics_summary["MCC"]
+auc_gs, auc_gs_std = metrics_summary["AUC"]
+
+# -------------------------------
+# DHI predictions
+# -------------------------------
+y_pred_dhi1 = df["DHI1"].values.astype(int)
+y_pred_dhi2 = df["DHI2"].values.astype(int)
+
+# -------------------------------
+# Bootstrap comparison
+# -------------------------------
+def bootstrap_diff(y_true, yA, yB, metric):
+    rng = np.random.default_rng(42)
+    delta = np.empty(N_BOOTSTRAP)
+
+    for i in range(N_BOOTSTRAP):
+        idx = rng.integers(0, len(y_true), len(y_true))
+        if metric == f1_score:
+            delta[i] = (
+                metric(y_true[idx], yA[idx], average="weighted")
+                - metric(y_true[idx], yB[idx], average="weighted")
+            )
+        else:
+            delta[i] = metric(y_true[idx], yA[idx]) - metric(y_true[idx], yB[idx])
+
+    return np.mean(delta), *np.percentile(delta, [2.5, 97.5])
+
+# -------------------------------
+# ROC plot
+# -------------------------------
+mean_tpr = np.mean(tpr_list, axis=0)
+mean_auc = np.mean(auc_list)
+std_auc = np.std(auc_list)
+
+plt.figure(figsize=(7, 6))
+plt.plot(mean_fpr, mean_tpr,
+         label=f"RF (AUC = {mean_auc:.2f} ± {std_auc:.2f})",
+         linewidth=2)
+plt.plot([0, 1], [0, 1], "--", lw=1)
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("ROC – Sorgenti_GS_nomi dataset")
+plt.legend()
+plt.grid(alpha=0.3)
+plt.show()
+
+"""
+CODE 3
+------
+Random Forest vs DHI indices on the combined dataset.
+Includes bootstrap comparison and ROC analysis.
+"""
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    matthews_corrcoef,
+    roc_curve,
+    roc_auc_score
+)
+from sklearn.inspection import permutation_importance
+
+# -------------------------------
+# Settings
+# -------------------------------
+TEST_SIZE = 0.30
+RANDOM_STATES = range(1, 101)
+N_BOOTSTRAP = 10_000
+ALPHA = 0.05
+mean_fpr = np.linspace(0, 1, 100)
+
+# -------------------------------
+# Data loading and merging
+# -------------------------------
+df1 = pd.read_csv("TAV_Machine.csv", sep=";")
+df1 = df1.drop(df1.index[160:167]).reset_index(drop=True)
+
+df2 = pd.read_csv("Sorgenti_GS_nomi.csv", sep=";").drop(columns=["Nome"])
+
+df = pd.concat([df1, df2], ignore_index=True)
+
+target = "Impatto"
+y_true = df[target].values
+
+X = df.drop(columns=[
+    target, "Tipo", "Spring group", "A/P", "Qm (L/s)",
+    "DHI1", "DHI2",
+    "Fault distance (m)", "Fault distance 2 (m)",
+    "Numero", "Tip"
+])
+# -------------------------------
+# Containers
+# -------------------------------
+y_pred_rf_list = []
+test_indices_list = []
+
+tpr_list = []
+auc_list = []
+
+acc_list = []
+prec_list = []
+rec_list = []
+f1_list = []
+mcc_list = []
+
+
+# -------------------------------
+# Random Forest training loop
+# -------------------------------
+for rs in RANDOM_STATES:
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y_true,
+        test_size=TEST_SIZE,
+        stratify=y_true,
+        random_state=rs
+    )
+
+    model = RandomForestClassifier(
+        random_state=rs,
+        max_depth=5,
+        n_estimators=440,
+        max_features="sqrt"
+    )
+
+    model.fit(X_train, y_train)
+
+    # Predictions
+    y_pred = model.predict(X_test)
+    y_pred_rf_list.append(y_pred)
+    test_indices_list.append(X_test.index)
+
+    # Predictions
+    y_pred = model.predict(X_test)
+    y_pred_rf_list.append(y_pred)
+    test_indices_list.append(X_test.index)
+
+    # --- Classification metrics ---
+    acc_list.append(accuracy_score(y_test, y_pred))
+    prec_list.append(precision_score(y_test, y_pred))
+    rec_list.append(recall_score(y_test, y_pred))
+    f1_list.append(f1_score(y_test, y_pred))
+    mcc_list.append(matthews_corrcoef(y_test, y_pred))
+
+    # --- ROC computation for current split ---
+    y_scores = model.predict_proba(X_test)[:, 1]
+
+    fpr, tpr, _ = roc_curve(y_test, y_scores)
+    roc_auc = roc_auc_score(y_test, y_scores)
+
+    # Interpolate TPR over a common FPR grid
+    tpr_interp = np.interp(mean_fpr, fpr, tpr)
+    tpr_interp[0] = 0.0
+
+    tpr_list.append(tpr_interp)
+    auc_list.append(roc_auc)
+# -------------------------------
+# Aggregate RF predictions
+# -------------------------------
+y_pred_rf_full = np.full(len(df), np.nan)
+for preds, idx in zip(y_pred_rf_list, test_indices_list):
+    y_pred_rf_full[idx] = preds
+
+y_pred_rf_full = y_pred_rf_full.astype(int)
+
+# -------------------------------
+# Final statistics (mean ± std)
+# -------------------------------
+metrics_summary = {
+    "Accuracy": (np.mean(acc_list), np.std(acc_list)),
+    "Precision": (np.mean(prec_list), np.std(prec_list)),
+    "Recall": (np.mean(rec_list), np.std(rec_list)),
+    "F1-score": (np.mean(f1_list), np.std(f1_list)),
+    "MCC": (np.mean(mcc_list), np.std(mcc_list)),
+    "AUC": (np.mean(auc_list), np.std(auc_list)),
+}
+
+print("\nPerformance metrics (mean ± std over 100 splits)")
+for m, (mean, std) in metrics_summary.items():
+    print(f"{m:10s}: {mean:.3f} ± {std:.3f}")
+
+acc_comb, acc_comb_std = metrics_summary["Accuracy"]
+prec_comb, prec_comb_std = metrics_summary["Precision"]
+rec_comb, rec_comb_std = metrics_summary["Recall"]
+f1_comb, f1_comb_std = metrics_summary["F1-score"]
+mcc_comb, mcc_comb_std = metrics_summary["MCC"]
+auc_comb, auc_comb_std = metrics_summary["AUC"]
+# -------------------------------
+# DHI predictions
+# -------------------------------
+y_pred_dhi1 = df["DHI1"].values.astype(int)
+y_pred_dhi2 = df["DHI2"].values.astype(int)
+
+# -------------------------------
+# Bootstrap comparison
+# -------------------------------
+def bootstrap_diff(y_true, yA, yB, metric):
+    rng = np.random.default_rng(42)
+    delta = np.empty(N_BOOTSTRAP)
+
+    for i in range(N_BOOTSTRAP):
+        idx = rng.integers(0, len(y_true), len(y_true))
+        if metric == f1_score:
+            delta[i] = (
+                metric(y_true[idx], yA[idx], average="weighted")
+                - metric(y_true[idx], yB[idx], average="weighted")
+            )
+        else:
+            delta[i] = metric(y_true[idx], yA[idx]) - metric(y_true[idx], yB[idx])
+
+    return np.mean(delta), *np.percentile(delta, [2.5, 97.5])
+
+# -------------------------------
+# ROC plot
+# -------------------------------
+mean_tpr = np.mean(tpr_list, axis=0)
+mean_auc = np.mean(auc_list)
+std_auc = np.std(auc_list)
+
+plt.figure(figsize=(7, 6))
+plt.plot(mean_fpr, mean_tpr,
+         label=f"RF (AUC = {mean_auc:.2f} ± {std_auc:.2f})",
+         linewidth=2)
+plt.plot([0, 1], [0, 1], "--", lw=1)
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("ROC – Combined dataset")
+plt.legend()
+plt.grid(alpha=0.3)
+plt.show()
+
+# -------------------------------
+# Summary metrics
+# -------------------------------
+summary = pd.DataFrame({
+    "Dataset": ["TAV", "Sorgenti_GS", "Combined"],
+    "Accuracy": [acc_tav, acc_gs, acc_comb],
+    "Precision": [prec_tav, prec_gs, prec_comb],
+    "Recall": [rec_tav, rec_gs, rec_comb],
+    "F1": [f1_tav, f1_gs, f1_comb],
+    "MCC": [mcc_tav, mcc_gs, mcc_comb],
+    "AUC": [auc_tav, auc_gs, auc_comb],
+})
+
+print(summary)
